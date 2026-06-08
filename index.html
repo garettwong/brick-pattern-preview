@@ -127,10 +127,41 @@ function inOpening(op,u,v){
   if(op.type==='circle'){ const dx=u-op.uc, dy=v-op.vc; return dx*dx+dy*dy<=op.rc*op.rc; }
   return false;
 }
-function brickHitsOpening(wall,u0,v0,u1,v1){
+// opening grown by margin m -> the band where the edge course lives; the field skips this.
+function inGrownOp(op,u,v,m){
+  if(op.type==='arch'){
+    const hw=op.ww/2;
+    if(u>=op.uc-hw-m && u<=op.uc+hw+m && v>=op.v0-m && v<=op.v0+op.wh) return true;
+    const dx=u-op.uc, dy=v-(op.v0+op.wh);
+    if(dy>=0 && dx*dx+dy*dy<=(hw+m)*(hw+m)) return true;
+    return false;
+  }
+  const dx=u-op.uc, dy=v-op.vc; return dx*dx+dy*dy<=(op.rc+m)*(op.rc+m);
+}
+function hitsGrown(wall,u0,v0,u1,v1,m){
   const pts=[[u0,v0],[u1,v0],[u0,v1],[u1,v1],[(u0+u1)/2,(v0+v1)/2]];
-  for(const op of wall.openings) for(const [pu,pv] of pts) if(inOpening(op,pu,pv)) return true;
+  for(const op of wall.openings) for(const [pu,pv] of pts) if(inGrownOp(op,pu,pv,m)) return true;
   return false;
+}
+// EDGE-FIRST: one course of bricks hugging an opening outline.
+// Returns [{cu,cv,phi}] where phi = in-plane angle of the brick's LENGTH axis (tangent to the edge).
+function borderFor(op, L, Hb, g){
+  const out=[];
+  if(op.type==='circle'){
+    const rad=op.rc+Hb/2, n=Math.max(12,Math.round(2*Math.PI*rad/(L+g)));
+    for(let i=0;i<n;i++){ const th=2*Math.PI*i/n; out.push({cu:op.uc+rad*Math.cos(th), cv:op.vc+rad*Math.sin(th), phi:th+Math.PI/2}); }
+    return out;
+  }
+  const hw=op.ww/2, top=op.v0+op.wh;
+  // jambs: a vertical course up each side
+  const nj=Math.max(1,Math.round(op.wh/(L+g)));
+  for(let i=0;i<nj;i++){ const cv=op.v0+(i+0.5)*op.wh/nj; out.push({cu:op.uc-hw-Hb/2,cv,phi:Math.PI/2}); out.push({cu:op.uc+hw+Hb/2,cv,phi:Math.PI/2}); }
+  // arch: voussoir course following the semicircle
+  const rad=hw+Hb/2, na=Math.max(4,Math.round(Math.PI*rad/(L+g)));
+  for(let i=0;i<=na;i++){ const th=Math.PI*i/na; out.push({cu:op.uc+rad*Math.cos(th), cv:top+rad*Math.sin(th), phi:th+Math.PI/2}); }
+  // sill course under a window (skip the ground-level door)
+  if(op.v0>0.15){ const ns=Math.max(1,Math.round(op.ww/(L+g))); for(let i=0;i<ns;i++){ out.push({cu:op.uc-hw+(i+0.5)*op.ww/ns, cv:op.v0-Hb/2, phi:0}); } }
+  return out;
 }
 
 // ---------- Build ----------
@@ -155,51 +186,52 @@ function build(){
   const base = new THREE.Color(params.color);
 
   const mats=[], cols=[];
-  const pos=new THREE.Vector3(), quat=new THREE.Quaternion(), scl=new THREE.Vector3();
-  const basis=new THREE.Matrix4(), m=new THREE.Matrix4(), jq=new THREE.Quaternion(), je=new THREE.Euler();
+  const NORMAL_Z=new THREE.Vector3(0,0,1);
+  const fieldMargin = Hb + g;   // field skips the opening + its one-brick edge course
+
+  // place a brick at wall-local (cu,cv); phi = in-plane angle of the length axis; jf scales jitter
+  function place(wall, baseQuat, cu, cv, phi, jf){
+    const ju=(rnd()-0.5)*g*1.8*params.randomness*jf;
+    const jv=(rnd()-0.5)*g*1.8*params.randomness*jf;
+    const jn=(rnd()-0.5)*T*0.7*params.randomness*jf;
+    const pos=new THREE.Vector3().copy(wall.origin)
+      .addScaledVector(wall.uDir, cu+ju)
+      .addScaledVector(wall.vDir, cv+jv)
+      .addScaledVector(wall.normal, (T/2 - INSET) + jn);
+    const q=baseQuat.clone();
+    if(phi) q.multiply(new THREE.Quaternion().setFromAxisAngle(NORMAL_Z, phi));
+    if(rotMax>0) q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((rnd()-0.5)*rotMax*jf,(rnd()-0.5)*rotMax*jf,(rnd()-0.5)*rotMax*jf)));
+    const sj=1+(rnd()-0.5)*0.16*params.randomness;
+    mats.push(new THREE.Matrix4().compose(pos,q,new THREE.Vector3(L*sj,Hb*sj,T)));
+    const c=base.clone(); c.multiplyScalar(1+(rnd()-0.5)*0.4*Math.max(0.25,params.randomness)); cols.push(c);
+  }
 
   for(const wall of walls){
-    basis.makeBasis(wall.uDir, wall.vDir, wall.normal);
-    const baseQuat = new THREE.Quaternion().setFromRotationMatrix(basis);
-    const rows = Math.floor(wall.vLen/stepV);
+    const basis=new THREE.Matrix4().makeBasis(wall.uDir, wall.vDir, wall.normal);
+    const baseQuat=new THREE.Quaternion().setFromRotationMatrix(basis);
+
+    // 1) EDGE-FIRST: lay the framing course around every opening (crisp -> low jitter)
+    for(const op of wall.openings){
+      for(const b of borderFor(op, L, Hb, g)){
+        if(b.cu<0 || b.cu>wall.uLen || b.cv<0 || b.cv>wall.vLen) continue;
+        place(wall, baseQuat, b.cu, b.cv, b.phi, 0.35);
+      }
+    }
+
+    // 2) FIELD: running bond, skipping each opening + its edge course
+    const rows=Math.floor(wall.vLen/stepV);
     for(let r=0;r<rows;r++){
-      const v0 = r*stepV;
-      const v1 = v0+Hb;
+      const v0=r*stepV, v1=v0+Hb;
       if(v1>wall.vLen) break;
       let off=0;
       if(params.bondType==='Running') off=(r%2)*(stepU/2);
       else if(params.bondType==='Wild') off=rnd()*stepU;
-      const nCols = Math.ceil(wall.uLen/stepU)+2;
+      const nCols=Math.ceil(wall.uLen/stepU)+2;
       for(let c=-1;c<nCols;c++){
-        const u0 = off + c*stepU;
-        const u1 = u0+L;
-        if(u0< -1e-4 || u1> wall.uLen+1e-4) continue;          // full bricks only -> clean corners
-        if(brickHitsOpening(wall,u0,v0,u1,v1)) continue;        // carve windows/door
-
-        const cu=(u0+u1)/2, cv=(v0+v1)/2;
-        const ju=(rnd()-0.5)*g*1.8*params.randomness;
-        const jv=(rnd()-0.5)*g*1.8*params.randomness;
-        const jn=(rnd()-0.5)*T*0.7*params.randomness;
-
-        pos.copy(wall.origin)
-           .addScaledVector(wall.uDir, cu+ju)
-           .addScaledVector(wall.vDir, cv+jv)
-           .addScaledVector(wall.normal, (T/2 - INSET) + jn);
-
-        quat.copy(baseQuat);
-        if(rotMax>0){
-          je.set((rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax);
-          jq.setFromEuler(je); quat.multiply(jq);
-        }
-        const sj = 1 + (rnd()-0.5)*0.16*params.randomness;
-        scl.set(L*sj, Hb*sj, T);
-        m.compose(pos,quat,scl);
-        mats.push(m.clone());
-
-        const c2 = base.clone();
-        const b = 1 + (rnd()-0.5)*0.4*Math.max(0.25, params.randomness);
-        c2.multiplyScalar(b);
-        cols.push(c2);
+        const u0=off+c*stepU, u1=u0+L;
+        if(u0<-1e-4 || u1>wall.uLen+1e-4) continue;             // full bricks only -> clean corners
+        if(hitsGrown(wall,u0,v0,u1,v1,fieldMargin)) continue;   // leave room for the opening + its frame
+        place(wall, baseQuat, (u0+u1)/2, (v0+v1)/2, 0, 1);
       }
     }
   }
