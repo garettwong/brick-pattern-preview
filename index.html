@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brick Pattern Preview</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b1d22;font-family:system-ui,-apple-system,sans-serif;color:#e6e6e6;}
+  #app{position:fixed;inset:0;}
+  #info{position:fixed;left:12px;top:12px;z-index:10;font-size:13px;line-height:1.45;background:rgba(0,0,0,.5);padding:10px 12px;border-radius:10px;max-width:230px;}
+  #info b{color:#ffb86c;}
+  #stats{position:fixed;left:12px;bottom:12px;z-index:10;font-size:12px;color:#86a;}
+  #stats b{color:#9be;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="info">
+  <b>Brick Preview</b><br>
+  Drag to orbit · scroll to zoom.<br>
+  Tune the panel (top-right), then hit <b>Export STL</b> to bake a printable mesh.
+</div>
+<div id="stats"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLExporter } from 'three/addons/exporters/STLExporter.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+const INSET = 0.05; // how far the brick skin sits in from the nominal wall face (gives recessed windows)
+
+// ---------- Renderer / scene ----------
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b1d22);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.01, 1000);
+camera.position.set(5.5, 4, 7);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404a55, 0.75));
+const sun = new THREE.DirectionalLight(0xfff3e0, 2.3);
+sun.position.set(7, 11, 5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+const s = 10;
+sun.shadow.camera.left=-s; sun.shadow.camera.right=s; sun.shadow.camera.top=s; sun.shadow.camera.bottom=-s;
+sun.shadow.bias = -0.0004;
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(80,80),
+  new THREE.MeshStandardMaterial({ color:0x2a2d34, roughness:1 })
+);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ---------- Parameters ----------
+const params = {
+  width: 4, depth: 3, height: 3.5,
+  brickLength: 0.22, brickHeight: 0.07, brickDepth: 0.045, mortarGap: 0.012,
+  bondType: 'Running',
+  randomness: 0.3,
+  rotation: 0.15,
+  color: 0xb05a34,
+  showCore: true,
+  exportSTL: () => exportSTL()
+};
+
+// ---------- Helpers ----------
+function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+function buildWalls(){
+  const W=params.width, D=params.depth, H=params.height;
+  const O=(x,y,z)=>new THREE.Vector3(x,y,z);
+  const V=(x,y,z)=>new THREE.Vector3(x,y,z);
+
+  // openings live only on the front (+Z) wall, in wall-local (u,v)
+  const cx = W/2;
+  const openings = [
+    // arched door, centre bottom
+    { type:'arch', uc:cx,        v0:0.0,  ww:Math.min(0.9, W*0.22), wh:1.4 },
+    // two arched windows flanking
+    { type:'arch', uc:W*0.25,    v0:1.25, ww:Math.min(0.6, W*0.16), wh:0.9 },
+    { type:'arch', uc:W*0.75,    v0:1.25, ww:Math.min(0.6, W*0.16), wh:0.9 },
+    // round (rose) window high centre
+    { type:'circle', uc:cx,      vc:H*0.8, rc:Math.min(0.42, H*0.13) },
+  ];
+
+  return [
+    { origin:O(-W/2,0, D/2), uDir:V(1,0,0),  vDir:V(0,1,0), normal:V(0,0,1),  uLen:W, vLen:H, openings },          // front
+    { origin:O( W/2,0,-D/2), uDir:V(-1,0,0), vDir:V(0,1,0), normal:V(0,0,-1), uLen:W, vLen:H, openings:[] },        // back
+    { origin:O( W/2,0, D/2), uDir:V(0,0,-1), vDir:V(0,1,0), normal:V(1,0,0),  uLen:D, vLen:H, openings:[] },        // right
+    { origin:O(-W/2,0,-D/2), uDir:V(0,0,1),  vDir:V(0,1,0), normal:V(-1,0,0), uLen:D, vLen:H, openings:[] },        // left
+  ];
+}
+
+function inOpening(op,u,v){
+  if(op.type==='arch'){
+    const hw=op.ww/2;
+    if(u>=op.uc-hw && u<=op.uc+hw && v>=op.v0 && v<=op.v0+op.wh) return true; // rect
+    const dx=u-op.uc, dy=v-(op.v0+op.wh);
+    if(dy>=0 && dx*dx+dy*dy<=hw*hw) return true;                              // arch top
+    return false;
+  }
+  if(op.type==='circle'){ const dx=u-op.uc, dy=v-op.vc; return dx*dx+dy*dy<=op.rc*op.rc; }
+  return false;
+}
+function brickHitsOpening(wall,u0,v0,u1,v1){
+  const pts=[[u0,v0],[u1,v0],[u0,v1],[u1,v1],[(u0+u1)/2,(v0+v1)/2]];
+  for(const op of wall.openings) for(const [pu,pv] of pts) if(inOpening(op,pu,pv)) return true;
+  return false;
+}
+
+// ---------- Build ----------
+const unitBox = new THREE.BoxGeometry(1,1,1);
+const brickMat = new THREE.MeshStandardMaterial({ color:0xffffff, roughness:0.93, metalness:0.0 });
+const coreMat  = new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1 });
+const roofMat  = new THREE.MeshStandardMaterial({ color:0x3a2c24, roughness:1 });
+
+let brickMesh=null, coreMesh=null, roofMesh=null;
+let lastMatrices=[];
+
+function build(){
+  if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); brickMesh.dispose(); }
+  if(coreMesh){ scene.remove(coreMesh); coreMesh.geometry.dispose(); }
+  if(roofMesh){ scene.remove(roofMesh); roofMesh.geometry.dispose(); }
+
+  const walls = buildWalls();
+  const L=params.brickLength, Hb=params.brickHeight, T=params.brickDepth, g=params.mortarGap;
+  const stepU=L+g, stepV=Hb+g;
+  const rnd = mulberry32(1337);
+  const rotMax = params.rotation * THREE.MathUtils.degToRad(16);
+  const base = new THREE.Color(params.color);
+
+  const mats=[], cols=[];
+  const pos=new THREE.Vector3(), quat=new THREE.Quaternion(), scl=new THREE.Vector3();
+  const basis=new THREE.Matrix4(), m=new THREE.Matrix4(), jq=new THREE.Quaternion(), je=new THREE.Euler();
+
+  for(const wall of walls){
+    basis.makeBasis(wall.uDir, wall.vDir, wall.normal);
+    const baseQuat = new THREE.Quaternion().setFromRotationMatrix(basis);
+    const rows = Math.floor(wall.vLen/stepV);
+    for(let r=0;r<rows;r++){
+      const v0 = r*stepV;
+      const v1 = v0+Hb;
+      if(v1>wall.vLen) break;
+      let off=0;
+      if(params.bondType==='Running') off=(r%2)*(stepU/2);
+      else if(params.bondType==='Wild') off=rnd()*stepU;
+      const nCols = Math.ceil(wall.uLen/stepU)+2;
+      for(let c=-1;c<nCols;c++){
+        const u0 = off + c*stepU;
+        const u1 = u0+L;
+        if(u0< -1e-4 || u1> wall.uLen+1e-4) continue;          // full bricks only -> clean corners
+        if(brickHitsOpening(wall,u0,v0,u1,v1)) continue;        // carve windows/door
+
+        const cu=(u0+u1)/2, cv=(v0+v1)/2;
+        const ju=(rnd()-0.5)*g*1.8*params.randomness;
+        const jv=(rnd()-0.5)*g*1.8*params.randomness;
+        const jn=(rnd()-0.5)*T*0.7*params.randomness;
+
+        pos.copy(wall.origin)
+           .addScaledVector(wall.uDir, cu+ju)
+           .addScaledVector(wall.vDir, cv+jv)
+           .addScaledVector(wall.normal, (T/2 - INSET) + jn);
+
+        quat.copy(baseQuat);
+        if(rotMax>0){
+          je.set((rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax);
+          jq.setFromEuler(je); quat.multiply(jq);
+        }
+        const sj = 1 + (rnd()-0.5)*0.16*params.randomness;
+        scl.set(L*sj, Hb*sj, T);
+        m.compose(pos,quat,scl);
+        mats.push(m.clone());
+
+        const c2 = base.clone();
+        const b = 1 + (rnd()-0.5)*0.4*Math.max(0.25, params.randomness);
+        c2.multiplyScalar(b);
+        cols.push(c2);
+      }
+    }
+  }
+
+  const count = mats.length;
+  brickMesh = new THREE.InstancedMesh(unitBox, brickMat, count);
+  brickMesh.castShadow = true; brickMesh.receiveShadow = true;
+  for(let i=0;i<count;i++){ brickMesh.setMatrixAt(i,mats[i]); brickMesh.setColorAt(i,cols[i]); }
+  brickMesh.instanceMatrix.needsUpdate = true;
+  if(brickMesh.instanceColor) brickMesh.instanceColor.needsUpdate = true;
+  scene.add(brickMesh);
+  lastMatrices = mats;
+
+  coreMesh = new THREE.Mesh(new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET), coreMat);
+  coreMesh.position.set(0, params.height/2, 0);
+  coreMesh.castShadow = true; coreMesh.receiveShadow = true;
+  coreMesh.visible = params.showCore;
+  scene.add(coreMesh);
+
+  const rh = params.height*0.45;
+  roofMesh = new THREE.Mesh(new THREE.ConeGeometry(Math.max(params.width,params.depth)*0.8, rh, 4), roofMat);
+  roofMesh.rotation.y = Math.PI/4;
+  roofMesh.position.set(0, params.height + rh/2 - 0.02, 0);
+  roofMesh.castShadow = true;
+  scene.add(roofMesh);
+
+  controls.target.set(0, params.height*0.5, 0);
+  document.getElementById('stats').innerHTML = `<b>${count.toLocaleString()}</b> bricks · ${params.bondType} bond · brick ${(L*100).toFixed(0)}×${(Hb*100).toFixed(0)}×${(T*100).toFixed(1)} cm`;
+}
+
+// ---------- Bake to STL ----------
+function exportSTL(){
+  const geoms=[];
+  for(const mat of lastMatrices){ const gg=unitBox.clone(); gg.applyMatrix4(mat); geoms.push(gg); }
+  const cg=new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET);
+  cg.translate(0, params.height/2, 0);
+  geoms.push(cg);
+  const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
+  const mesh=new THREE.Mesh(merged);
+  const data=new STLExporter().parse(mesh,{binary:true});
+  const blob=new Blob([data],{type:'application/octet-stream'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='brick-building.stl';
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  merged.dispose();
+}
+
+// ---------- GUI ----------
+const gui = new GUI({ title:'Brick Controls' });
+const fB = gui.addFolder('Building');
+fB.add(params,'width',2,8,0.1).onChange(build);
+fB.add(params,'depth',2,8,0.1).onChange(build);
+fB.add(params,'height',2,6,0.1).onChange(build);
+const fK = gui.addFolder('Brick');
+fK.add(params,'brickLength',0.08,0.40,0.005).name('Brick size (length)').onChange(build);
+fK.add(params,'brickHeight',0.03,0.15,0.002).name('Brick height').onChange(build);
+fK.add(params,'brickDepth',0.01,0.12,0.002).name('Brick depth (relief)').onChange(build);
+fK.add(params,'mortarGap',0,0.04,0.001).name('Mortar gap').onChange(build);
+fK.add(params,'bondType',['Running','Stack','Wild']).name('Brick type / bond').onChange(build);
+fK.add(params,'randomness',0,1,0.01).name('Randomness').onChange(build);
+fK.add(params,'rotation',0,1,0.01).name('Rotation jitter').onChange(build);
+fK.addColor(params,'color').name('Brick colour').onChange(build);
+const fV = gui.addFolder('View / Export');
+fV.add(params,'showCore').name('Show core wall').onChange(v=>{ if(coreMesh) coreMesh.visible=v; });
+fV.add(params,'exportSTL').name('⬇  Export STL (bake)');
+
+// ---------- Loop ----------
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+build();
+(function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); })();
+</script>
+</body>
+</html>
